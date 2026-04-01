@@ -1,3 +1,4 @@
+// Redeployed: 2026-04-01T15:52:30Z
 /**
  * Yahoo Finance proxy — runs on Vercel Edge, bypasses Railway IP blocks.
  * Handles cookie+crumb auth flow transparently.
@@ -7,6 +8,7 @@
  *   GET /quotes?symbols=A,B,C  → batch quotes
  *   GET /chart/:symbol?range=  → historical OHLCV
  *   GET /fx?currencies=CAD,EUR → USD-based FX rates
+ *   GET /fx-pair?from=X&to=Y   → specific FX pair rate
  *   GET /ticker-info/:symbol   → longName, currency, exchange
  */
 
@@ -14,7 +16,7 @@
 let cachedCrumb = null;
 let cachedCookies = null;
 let crumbFetchedAt = 0;
-const CRUMB_TTL_MS = 60 * 60 * 1000; // 1 hour
+const CRUMB_TTL_MS = 45 * 60 * 1000; // 45 minutes
 
 const YF_HEADERS = {
   "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
@@ -36,7 +38,9 @@ async function refreshCrumb() {
     headers: { ...YF_HEADERS, Cookie: cookieStr },
   });
   const crumb = await r2.text();
-  if (!crumb || crumb.includes("<")) throw new Error("Failed to get crumb");
+  if (!crumb || crumb.includes("<") || crumb.includes("Too Many")) {
+    throw new Error("Failed to get crumb: " + crumb.slice(0, 80));
+  }
 
   cachedCrumb = crumb;
   cachedCookies = cookieStr;
@@ -44,30 +48,49 @@ async function refreshCrumb() {
   return { crumb, cookieStr };
 }
 
-async function getCrumb() {
-  if (cachedCrumb && Date.now() - crumbFetchedAt < CRUMB_TTL_MS) {
+async function getCrumb(force = false) {
+  if (!force && cachedCrumb && Date.now() - crumbFetchedAt < CRUMB_TTL_MS) {
     return { crumb: cachedCrumb, cookieStr: cachedCookies };
   }
   return refreshCrumb();
 }
 
-async function yfFetch(path) {
+async function yfFetch(path, retry = true) {
   const { crumb, cookieStr } = await getCrumb();
   const sep = path.includes("?") ? "&" : "?";
   const url = `https://query1.finance.yahoo.com${path}${sep}crumb=${encodeURIComponent(crumb)}`;
   const r = await fetch(url, {
     headers: { ...YF_HEADERS, Cookie: cookieStr },
   });
-  // If crumb expired (401/404), refresh once and retry
-  if (r.status === 401 || r.status === 404) {
-    const fresh = await refreshCrumb();
+
+  // Handle stale crumb or rate limit — refresh and retry once
+  if (r.status === 401 || r.status === 429 || r.status === 404) {
+    if (retry) {
+      // Force a fresh crumb
+      cachedCrumb = null;
+      const fresh = await getCrumb(true);
+      const url2 = `https://query1.finance.yahoo.com${path}${sep}crumb=${encodeURIComponent(fresh.crumb)}`;
+      const r2 = await fetch(url2, {
+        headers: { ...YF_HEADERS, Cookie: fresh.cookieStr },
+      });
+      return r2;
+    }
+  }
+
+  // Also check if text response is "Too Many Requests"
+  const text = await r.text();
+  if (text.startsWith("Too Many") && retry) {
+    cachedCrumb = null;
+    const fresh = await getCrumb(true);
     const url2 = `https://query1.finance.yahoo.com${path}${sep}crumb=${encodeURIComponent(fresh.crumb)}`;
     const r2 = await fetch(url2, {
       headers: { ...YF_HEADERS, Cookie: fresh.cookieStr },
     });
-    return r2;
+    const text2 = await r2.text();
+    return { ok: r2.ok, status: r2.status, text: () => Promise.resolve(text2), json: () => Promise.resolve(JSON.parse(text2)) };
   }
-  return r;
+
+  return { ok: r.ok, status: r.status, text: () => Promise.resolve(text), json: () => Promise.resolve(JSON.parse(text)) };
 }
 
 function corsHeaders(origin) {
@@ -83,7 +106,6 @@ export default async function handler(req, res) {
   const origin = req.headers["origin"] || "*";
   const headers = corsHeaders(origin);
 
-  // OPTIONS preflight
   if (req.method === "OPTIONS") {
     for (const [k, v] of Object.entries(headers)) res.setHeader(k, v);
     return res.status(204).end();
@@ -92,9 +114,8 @@ export default async function handler(req, res) {
   for (const [k, v] of Object.entries(headers)) res.setHeader(k, v);
   res.setHeader("Content-Type", "application/json");
 
-  // Parse route from URL
   const url = new URL(req.url, `https://${req.headers.host}`);
-  const path = url.pathname.replace(/^\/+/, ""); // strip leading slashes
+  const path = url.pathname.replace(/^\/+/, "");
   const parts = path.split("/");
 
   try {
@@ -104,12 +125,10 @@ export default async function handler(req, res) {
       const r = await yfFetch(`/v8/finance/chart/${symbol}?interval=1d&range=1d`);
       const data = await r.json();
       const meta = data?.chart?.result?.[0]?.meta;
-      if (!meta) return res.status(404).json({ error: "Symbol not found" });
-      const quotes = data?.chart?.result?.[0]?.indicators?.quote?.[0];
-      const closes = quotes?.close?.filter((v) => v != null) ?? [];
+      if (!meta) return res.status(404).json({ error: "Symbol not found", raw: JSON.stringify(data).slice(0, 200) });
       const prevClose = meta.chartPreviousClose ?? meta.previousClose ?? meta.regularMarketPrice;
-      const price = meta.regularMarketPrice ?? (closes.length ? closes[closes.length - 1] : null);
-      const change = price != null && prevClose != null ? price - prevClose : 0;
+      const price = meta.regularMarketPrice ?? 0;
+      const change = price && prevClose ? price - prevClose : 0;
       const changePercent = prevClose ? (change / prevClose) * 100 : 0;
       return res.json({
         symbol,
@@ -206,7 +225,7 @@ export default async function handler(req, res) {
         const d = new Date(ts * 1000);
         if (range === "1w") {
           const totalMin = d.getUTCHours() * 60 + d.getUTCMinutes();
-          if (totalMin < 13 * 60 + 30) return; // skip pre-market
+          if (totalMin < 13 * 60 + 30) return;
         }
         timestamps.push(d.getTime());
         prices.push(close);
